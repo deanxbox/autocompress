@@ -19,4 +19,5 @@
 - set a limit a bit below your ideal size
 - ensure you set a realistic time limit 
 - lower resolution scaling can help encoding speed & artifacting 
-- ffmpeg will likely utilize the majority of your cpu when compressing as this plugin currently only does software encoding, support for hardware accel may happen eventually (but probably not)
+- GPU encoders are preferred when available (`h264_nvenc`, `h264_amf`, `h264_qsv`, or `h264_videotoolbox`), with software `libx264` as the final fallback
+- very large source videos may be retried at 1080p on GPU if the hardware encoder rejects the original resolution
