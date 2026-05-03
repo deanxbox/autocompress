@@ -126,7 +126,7 @@ function isAudioMime(mimeType: string): boolean {
 
 export async function openTempFile(_: IpcMainInvokeEvent, fileName: string): Promise<string> {
     const ext = path.extname(fileName) || ".tmp";
-    const tempPath = path.join(os.tmpdir(), `ac_in_${Date.now()}${ext}`);
+    const tempPath = path.join(os.tmpdir(), `ac_in_${Date.now()}_${Math.random().toString(36).slice(2)}${ext}`);
     openStreams.set(tempPath, createWriteStream(tempPath));
     return tempPath;
 }
@@ -272,11 +272,14 @@ export async function handleFile(
     target: number,
     preset: string,
     resolution: string,
+    maxWidth: number,
+    maxHeight: number,
+    useHardwareDecode: boolean,
     timeout: number,
 ): Promise<CompressResult> {
     const preferredExt = isAudioMime(mimeType) ? ".m4a" : ".mp4";
     const fileExt = path.extname(fileName) || preferredExt;
-    const outPath = path.join(os.tmpdir(), `ac_out_${Date.now()}${fileExt}`);
+    const outPath = path.join(os.tmpdir(), `ac_out_${jobId}${fileExt}`);
 
     try {
         const duration = await getMediaDuration(filePath);
@@ -310,7 +313,8 @@ export async function handleFile(
                     throw err;
                 }
 
-                const resolutionAttempts = resolution === "original" && encoder !== "libx264"
+                const hasCustomDimensions = getPositiveDimension(maxWidth) > 0 || getPositiveDimension(maxHeight) > 0;
+                const resolutionAttempts = resolution === "original" && !hasCustomDimensions && encoder !== "libx264"
                     ? ["original", "1080"]
                     : [resolution];
 
@@ -326,6 +330,9 @@ export async function handleFile(
                             audioBitrate,
                             preset,
                             resolutionAttempt,
+                            maxWidth,
+                            maxHeight,
+                            useHardwareDecode,
                             timeout,
                             encoder,
                             duration,
@@ -463,7 +470,23 @@ function parseProgressPercent(line: string, totalDuration: number): number | nul
     return null;
 }
 
-function buildScaleFilter(maxResolution: string): string | null {
+function getPositiveDimension(value: number): number {
+    if (!Number.isFinite(value) || value <= 0) return 0;
+
+    return Math.floor(value);
+}
+
+function buildScaleFilter(maxResolution: string, maxWidth: number, maxHeight: number): string | null {
+    const customWidth = getPositiveDimension(maxWidth);
+    const customHeight = getPositiveDimension(maxHeight);
+
+    if (customWidth > 0 || customHeight > 0) {
+        const widthExpr = customWidth > 0 ? `min(iw,${customWidth})` : "iw";
+        const heightExpr = customHeight > 0 ? `min(ih,${customHeight})` : "ih";
+
+        return `scale=w='${widthExpr}':h='${heightExpr}':force_original_aspect_ratio=decrease,pad='ceil(iw/2)*2':'ceil(ih/2)*2'`;
+    }
+
     const resolutionMap: Record<string, string> = {
         "1080": "scale=w='min(iw,1920)':h='min(ih,1080)':force_original_aspect_ratio=decrease,pad='ceil(iw/2)*2':'ceil(ih/2)*2'",
         "720": "scale=w='min(iw,1280)':h='min(ih,720)':force_original_aspect_ratio=decrease,pad='ceil(iw/2)*2':'ceil(ih/2)*2'",
@@ -473,8 +496,8 @@ function buildScaleFilter(maxResolution: string): string | null {
     return resolutionMap[maxResolution] ?? null;
 }
 
-function buildVideoFilter(maxResolution: string): string | null {
-    const scaleFilter = buildScaleFilter(maxResolution);
+function buildVideoFilter(maxResolution: string, maxWidth: number, maxHeight: number): string | null {
+    const scaleFilter = buildScaleFilter(maxResolution, maxWidth, maxHeight);
     if (scaleFilter) return `${scaleFilter},format=yuv420p`;
 
     return null;
@@ -487,6 +510,9 @@ function compressVideo(
     audioBitrate: number,
     preset: string,
     maxResolution: string,
+    maxWidth: number,
+    maxHeight: number,
+    useHardwareDecode: boolean,
     ffmpegTimeout: number,
     encoder: VideoEncoder,
     duration: number,
@@ -495,16 +521,18 @@ function compressVideo(
     isCancelled: () => boolean,
 ): Promise<void> {
     return new Promise((resolve, reject) => {
+        const filter = buildVideoFilter(maxResolution, maxWidth, maxHeight);
+        const canUseHardwareDecode = useHardwareDecode && encoder !== "libx264" && filter === null;
         const args = [
             "-y",
             "-hide_banner",
+            ...(canUseHardwareDecode ? ["-hwaccel", "auto"] : []),
             "-i", inputPath,
             "-map", "0:v:0",
             "-map", "0:a?",
             ...buildEncoderArgs(encoder, vidBitrate, preset),
         ];
 
-        const filter = buildVideoFilter(maxResolution);
         if (filter) {
             args.push("-vf", filter);
         }

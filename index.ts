@@ -22,8 +22,8 @@ import {
 } from "@webpack/common";
 
 type ProcessResult =
-    | { success: true; file: File; originalSizeMB: number; sizeMB: number; encoderUsed: string; }
-    | { success: false; fileName: string; error: string; cancelled?: true; };
+    | { success: true; file: File; originalFileName: string; originalSizeMB: number; sizeMB: number; encoderUsed: string; output: "compressed" | "original"; note?: string; }
+    | { success: false; file: File; fileName: string; error: string; cancelled?: true; };
 
 const Native = VencordNative.pluginHelpers.AutoCompress as PluginNative<
     typeof import("./native")
@@ -50,6 +50,8 @@ const CHUNK_SIZE = 4 * 1024 * 1024;
 const DUPLICATE_BATCH_MS = 1500;
 
 type CompressionKind = "media" | "image";
+type CompressionMode = "auto" | "media" | "image" | "off";
+type FailedFileBehavior = "upload-original" | "skip";
 type SizeUnit = "KB" | "MB" | "GB";
 type SizeSetting = number | { value: number; unit: SizeUnit; };
 
@@ -64,6 +66,24 @@ const SIZE_UNIT_OPTIONS = [
     { label: "MB", value: "MB" },
     { label: "GB", value: "GB" },
 ];
+
+const COMPRESSION_MODE_OPTIONS = [
+    { label: "Auto (Videos, Audio, Images)", value: "auto", default: true },
+    { label: "Videos + Audio Only", value: "media" },
+    { label: "Images Only", value: "image" },
+    { label: "Off", value: "off" },
+];
+
+const FAILED_FILE_BEHAVIOR_OPTIONS = [
+    { label: "Skip failed file", value: "skip", default: true },
+    { label: "Upload original", value: "upload-original" },
+];
+
+function debugLog(message: string, ...args: unknown[]) {
+    if (settings.store.debugLogging) {
+        console.log(`[AutoCompress] ${message}`, ...args);
+    }
+}
 
 function normalizeSizeSetting(raw: unknown, fallbackValue: number, fallbackUnit: SizeUnit): { value: number; unit: SizeUnit; } {
     if (typeof raw === "object" && raw !== null) {
@@ -169,7 +189,96 @@ function SizeSettingControl({
     );
 }
 
+function DiagnosticsControl() {
+    const [isRunning, setIsRunning] = useState(false);
+
+    async function runDiagnostics() {
+        if (isRunning) return;
+
+        setIsRunning(true);
+        try {
+            const ffmpegPath = settings.store.ffmpegPath?.trim() || undefined;
+            const ffprobePath = settings.store.ffprobePath?.trim() || undefined;
+            const validation = await Native.testBinaries(ffmpegPath, ffprobePath);
+            const diagnostics = await Native.getDiagnostics();
+            const payload = {
+                validation,
+                settings: {
+                    compressionMode: settings.store.compressionMode,
+                    compressionTarget: settings.store.compressionTarget,
+                    compressionThreshold: settings.store.compressionThreshold,
+                    compressionPreset: settings.store.compressionPreset,
+                    maxResolution: settings.store.maxResolution,
+                    maxWidth: settings.store.maxWidth,
+                    maxHeight: settings.store.maxHeight,
+                    concurrentJobs: settings.store.concurrentJobs,
+                    useHardwareDecode: settings.store.useHardwareDecode,
+                    debugLogging: settings.store.debugLogging,
+                },
+                diagnostics,
+            };
+            const text = JSON.stringify(payload, null, 2);
+
+            console.log("[AutoCompress] Diagnostics", payload);
+            await navigator.clipboard.writeText(text).catch(() => undefined);
+
+            showNotification({
+                title: "AutoCompress",
+                body: validation.success
+                    ? `Diagnostics copied. Encoder: ${validation.encoder ?? "unknown"}`
+                    : `Diagnostics copied. Validation failed: ${validation.error}`,
+                color: validation.success ? "#43b581" : "#faa61a",
+                noPersist: false,
+            });
+        } catch (err) {
+            showNotification({
+                title: "AutoCompress",
+                body: `Diagnostics failed: ${err instanceof Error ? err.message : String(err)}`,
+                color: "#f04747",
+                noPersist: false,
+            });
+        } finally {
+            setIsRunning(false);
+        }
+    }
+
+    return React.createElement(
+        "div",
+        { style: { marginBottom: "20px" } },
+        React.createElement(
+            "div",
+            { style: { marginBottom: "8px" } },
+            React.createElement(Text, { variant: "text-md/medium" }, "Diagnostics"),
+            React.createElement(Text, { color: "text-muted", variant: "text-sm/normal" }, "Test ffmpeg/GPU support and copy a report to the clipboard"),
+        ),
+        React.createElement(
+            "button",
+            {
+                disabled: isRunning,
+                onClick: runDiagnostics,
+                style: {
+                    background: "var(--brand-experiment, #5865f2)",
+                    border: "none",
+                    borderRadius: "4px",
+                    color: "#fff",
+                    cursor: isRunning ? "default" : "pointer",
+                    fontSize: "14px",
+                    fontWeight: 600,
+                    padding: "8px 12px",
+                    opacity: isRunning ? 0.7 : 1,
+                },
+            },
+            isRunning ? "Running..." : "Run Diagnostics",
+        ),
+    );
+}
+
 const settings = definePluginSettings({
+    compressionMode: {
+        type: OptionType.SELECT,
+        description: "Which attachment types AutoCompress should intercept",
+        options: COMPRESSION_MODE_OPTIONS,
+    },
     ffmpegTimeout: {
         type: OptionType.NUMBER,
         description: "Duration per file before compression is aborted [seconds]",
@@ -207,6 +316,16 @@ const settings = definePluginSettings({
             setValue: props.setValue,
         }),
     },
+    useOriginalIfWorse: {
+        type: OptionType.BOOLEAN,
+        description: "Upload the original file if compression makes it larger",
+        default: false,
+    },
+    failedFileBehavior: {
+        type: OptionType.SELECT,
+        description: "What to do when an individual file fails compression",
+        options: FAILED_FILE_BEHAVIOR_OPTIONS,
+    },
     compressionPreset: {
         type: OptionType.SELECT,
         description: "Encoding speed (slower results in better quality at the same size)",
@@ -227,6 +346,35 @@ const settings = definePluginSettings({
             { label: "720p", value: "720" },
             { label: "480p", value: "480" },
         ],
+    },
+    maxWidth: {
+        type: OptionType.NUMBER,
+        description: "Optional custom maximum width in pixels (0 uses the preset above)",
+        default: 0,
+    },
+    maxHeight: {
+        type: OptionType.NUMBER,
+        description: "Optional custom maximum height in pixels (0 uses the preset above)",
+        default: 0,
+    },
+    concurrentJobs: {
+        type: OptionType.NUMBER,
+        description: "Maximum files to compress at once (higher can use more GPU, but may make Discord less responsive)",
+        default: 2,
+    },
+    useHardwareDecode: {
+        type: OptionType.BOOLEAN,
+        description: "Use GPU decoding when ffmpeg can do so safely",
+        default: true,
+    },
+    debugLogging: {
+        type: OptionType.BOOLEAN,
+        description: "Log AutoCompress pipeline details to the console",
+        default: false,
+    },
+    diagnostics: {
+        type: OptionType.COMPONENT,
+        component: DiagnosticsControl,
     },
 });
 
@@ -369,6 +517,36 @@ function getCompressionThresholdBytes(): number {
     return getStoredSizeBytes("compressionThreshold", 10);
 }
 
+function getCompressionMode(): CompressionMode {
+    const mode = settings.store.compressionMode;
+    return mode === "media" || mode === "image" || mode === "off" ? mode : "auto";
+}
+
+function getFailedFileBehavior(): FailedFileBehavior {
+    return settings.store.failedFileBehavior === "upload-original" ? "upload-original" : "skip";
+}
+
+function getConcurrentJobs(): number {
+    const value = Number(settings.store.concurrentJobs);
+    if (!Number.isFinite(value)) return 2;
+
+    return Math.max(1, Math.min(8, Math.floor(value)));
+}
+
+function getMaxDimension(value: unknown): number {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+
+    return Math.floor(parsed);
+}
+
+function getCustomMaxDimensions(): { width: number; height: number; } {
+    return {
+        width: getMaxDimension(settings.store.maxWidth),
+        height: getMaxDimension(settings.store.maxHeight),
+    };
+}
+
 function formatSize(sizeMB: number): string {
     const bytes = sizeMB * SIZE_UNIT_BYTES.MB;
 
@@ -380,11 +558,38 @@ function formatSize(sizeMB: number): string {
         : `${sizeMB.toFixed(1)} MB`;
 }
 
+function formatBytes(bytes: number): string {
+    return formatSize(bytes / SIZE_UNIT_BYTES.MB);
+}
+
 function formatPercentChange(originalSizeMB: number, sizeMB: number): string {
     if (originalSizeMB <= 0) return "0%";
 
     const change = ((sizeMB - originalSizeMB) / originalSizeMB) * 100;
     return `${change > 0 ? "+" : ""}${change.toFixed(1)}%`;
+}
+
+function formatResultLine(result: Extract<ProcessResult, { success: true; }>): string {
+    if (result.output === "original") {
+        return `${result.originalFileName}: kept original (${formatSize(result.originalSizeMB)}${result.note ? `, ${result.note}` : ""})`;
+    }
+
+    return `${result.originalFileName}: ${formatSize(result.originalSizeMB)} -> ${formatSize(result.sizeMB)} (${formatPercentChange(result.originalSizeMB, result.sizeMB)})`;
+}
+
+function makeOriginalFallbackResult(file: File, note: string): Extract<ProcessResult, { success: true; }> | null {
+    if (!settings.store.useOriginalIfWorse || file.size > getCompressionTargetBytes()) return null;
+
+    return {
+        success: true,
+        file,
+        originalFileName: file.name,
+        originalSizeMB: file.size / SIZE_UNIT_BYTES.MB,
+        sizeMB: file.size / SIZE_UNIT_BYTES.MB,
+        encoderUsed: "original",
+        output: "original",
+        note,
+    };
 }
 
 function formatEta(seconds: number): string {
@@ -442,6 +647,36 @@ function removeProgressCard(jobId: string) {
     if (overlay && overlay.childElementCount === 0) overlay.remove();
 }
 
+function createPostCompressionPreview(lines: string[], color: string) {
+    if (lines.length === 0) return;
+
+    const jobId = `preview-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const card = document.createElement("div");
+    card.dataset.jobId = jobId;
+    Object.assign(card.style, {
+        background: "var(--background-floating, #18191c)",
+        border: `1px solid ${color}`,
+        borderRadius: "8px",
+        padding: "10px 12px",
+        width: "min(520px, calc(100vw - 32px))",
+        pointerEvents: "none",
+        boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
+    });
+
+    const title = document.createElement("div");
+    title.style.cssText = "font-size:13px;font-weight:700;color:var(--header-primary,#fff);margin-bottom:4px;";
+    title.textContent = "AutoCompress";
+
+    const body = document.createElement("div");
+    body.style.cssText = "font-size:12px;line-height:1.35;color:var(--text-normal,#dcddde);white-space:pre-wrap;";
+    body.textContent = lines.slice(0, 6).join("\n") + (lines.length > 6 ? `\n+${lines.length - 6} more` : "");
+
+    card.appendChild(title);
+    card.appendChild(body);
+    getOrCreateOverlay().appendChild(card);
+    setTimeout(() => removeProgressCard(jobId), 8_000);
+}
+
 function isValid(files: FileList | undefined): files is FileList {
     return files !== undefined && files.length > 0;
 }
@@ -453,8 +688,13 @@ function getCompressionKind(file: File): CompressionKind | null {
 }
 
 function shouldCompressFile(file: File): boolean {
-    return getCompressionKind(file) !== null
-        && file.size > getCompressionThresholdBytes();
+    const kind = getCompressionKind(file);
+    const mode = getCompressionMode();
+
+    if (kind === null || mode === "off") return false;
+    if (mode !== "auto" && kind !== mode) return false;
+
+    return file.size > getCompressionThresholdBytes();
 }
 
 function getBatchKey(files: File[]): string {
@@ -476,6 +716,10 @@ function shouldSkipDuplicateBatch(files: File[]): boolean {
     return false;
 }
 
+function hasFileDrag(event: DragEvent): boolean {
+    return Array.from(event.dataTransfer?.types ?? []).includes("Files");
+}
+
 function makeCancelledError(): Error & { cancelled: true; } {
     const err = new Error("cancelled") as Error & { cancelled: true; };
     err.cancelled = true;
@@ -488,6 +732,22 @@ function getFileKey(file: File): string {
 
 function getUploadFile(upload: unknown): File | null {
     return (upload as { item?: { file?: File; }; })?.item?.file ?? null;
+}
+
+function addFilesToUploadManager(channelId: string, files: File[]) {
+    if (files.length === 0) return;
+
+    debugLog("adding files to Discord upload queue", {
+        count: files.length,
+        names: files.map(f => f.name),
+        target: getCompressionTargetBytes(),
+    });
+    UploadManager.addFiles({
+        channelId,
+        draftType: DraftType.ChannelMessage,
+        files: files.map(file => ({ file, platform: 1 })),
+        showLargeMessageDialog: false,
+    });
 }
 
 function createUploadCancelCard(channelId: string, files: File[]) {
@@ -561,13 +821,24 @@ async function hookPaste(event: ClipboardEvent) {
 
     const allFiles = Array.from(files);
     if (!allFiles.some(shouldCompressFile)) return;
-    if (allFiles.some(file => shouldCompressFile(file) && getCompressionKind(file) === "media") && !(await validateBinaries())) return;
 
+    debugLog("paste intercepted", allFiles.map(file => ({ name: file.name, size: file.size, type: file.type, shouldCompress: shouldCompressFile(file) })));
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation();
     if (shouldSkipDuplicateBatch(allFiles)) return;
+    if (allFiles.some(file => shouldCompressFile(file) && getCompressionKind(file) === "media") && !(await validateBinaries())) return;
+
     await handleFiles(allFiles);
+}
+
+function hookDragOver(event: DragEvent) {
+    if (!hasFileDrag(event) || getCompressionMode() === "off") return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
 }
 
 async function hookDrop(event: DragEvent) {
@@ -576,16 +847,31 @@ async function hookDrop(event: DragEvent) {
 
     const allFiles = Array.from(files);
     if (!allFiles.some(shouldCompressFile)) return;
-    if (allFiles.some(file => shouldCompressFile(file) && getCompressionKind(file) === "media") && !(await validateBinaries())) return;
 
+    debugLog("drop intercepted", allFiles.map(file => ({ name: file.name, size: file.size, type: file.type, shouldCompress: shouldCompressFile(file) })));
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation();
     if (shouldSkipDuplicateBatch(allFiles)) return;
+    if (allFiles.some(file => shouldCompressFile(file) && getCompressionKind(file) === "media") && !(await validateBinaries())) return;
+
     await handleFiles(allFiles);
 }
 
 async function handleFiles(allFiles: File[]) {
+    try {
+        return await doHandleFiles(allFiles);
+    } catch (err) {
+        showNotification({
+            title: "AutoCompress",
+            body: `Unexpected error: ${err instanceof Error ? err.message : String(err)}`,
+            color: "#f04747",
+            noPersist: false,
+        });
+    }
+}
+
+async function doHandleFiles(allFiles: File[]) {
     const compressibleFiles: File[] = [];
     const otherFiles: File[] = [];
 
@@ -600,48 +886,76 @@ async function handleFiles(allFiles: File[]) {
     const channelId = SelectedChannelStore.getChannelId();
     if (!channelId) return;
 
+    debugLog("handling files", {
+        total: allFiles.length,
+        compressible: compressibleFiles.length,
+        passthrough: otherFiles.length,
+        target: getCompressionTargetBytes(),
+        threshold: getCompressionThresholdBytes(),
+        concurrentJobs: getConcurrentJobs(),
+    });
+
     if (compressibleFiles.length === 0) {
         if (otherFiles.length > 0) {
-            UploadManager.addFiles({
-                channelId,
-                draftType: DraftType.ChannelMessage,
-                files: otherFiles.map(file => ({ file, platform: 1 })),
-                showLargeMessageDialog: false,
-            });
+            await addFilesToUploadManager(channelId, otherFiles);
             createUploadCancelCard(channelId, otherFiles);
         }
         return;
     }
 
-    const results = await Promise.all(compressibleFiles.map(file => processFile(file)));
+    const results = await processFilesLimited(compressibleFiles);
 
     const successful = results.filter((r): r is Extract<ProcessResult, { success: true; }> => r.success);
     const cancelled = results.filter((r): r is Extract<ProcessResult, { success: false; cancelled: true; }> => !r.success && !!r.cancelled);
     const failed = results.filter((r): r is Extract<ProcessResult, { success: false; }> => !r.success && !r.cancelled);
-    const toUpload = [...successful.map(r => r.file), ...otherFiles];
+    const fallbackFiles = getFailedFileBehavior() === "upload-original"
+        ? failed.map(r => r.file).filter(file => file.size <= getCompressionTargetBytes())
+        : [];
+    const skippedOversizedFallbacks = getFailedFileBehavior() === "upload-original"
+        ? failed.filter(r => r.file.size > getCompressionTargetBytes())
+        : [];
+    const toUpload = [...successful.map(r => r.file), ...fallbackFiles, ...otherFiles];
+
+    debugLog("compression complete", {
+        successful: successful.map(r => ({
+            originalFileName: r.originalFileName,
+            outputName: r.file.name,
+            outputSize: r.file.size,
+            output: r.output,
+            encoderUsed: r.encoderUsed,
+        })),
+        failed: failed.map(r => ({ fileName: r.fileName, error: r.error })),
+        cancelled: cancelled.length,
+        fallbackUploads: fallbackFiles.map(file => ({ name: file.name, size: file.size })),
+        uploadCount: toUpload.length,
+    });
 
     if (cancelled.length === results.length) {
         showToast("Compression cancelled", Toasts.Type.MESSAGE);
         return;
     }
 
+    const previewLines = [
+        ...successful.map(formatResultLine),
+        ...fallbackFiles.map(file => `${file.name}: uploaded original after compression failed`),
+        ...skippedOversizedFallbacks.map(file => `${file.fileName}: skipped original because it is above target`),
+    ];
+    createPostCompressionPreview(previewLines, failed.length === 0 ? "#43b581" : "#faa61a");
+
     const messageParts = [
         `Compressed ${successful.length}/${results.length} file(s)`,
         failed.length > 0 ? `Failed: ${failed.map(f => `${f.fileName} (${f.error})`).join(", ")}` : "",
         cancelled.length > 0 ? `Cancelled: ${cancelled.length}` : "",
+        fallbackFiles.length > 0 ? `Fallback: uploaded ${fallbackFiles.length} original file(s)` : "",
+        skippedOversizedFallbacks.length > 0 ? `Skipped oversized originals: ${skippedOversizedFallbacks.length}` : "",
         successful.length > 0 ? `Encoder: ${Array.from(new Set(successful.map(r => r.encoderUsed))).join(", ")}` : "",
         successful.length > 0
-            ? `Changes:\n${successful.map(r => `${r.file.name}: ${formatSize(r.originalSizeMB)} -> ${formatSize(r.sizeMB)} (${formatPercentChange(r.originalSizeMB, r.sizeMB)})`).join("\n")}`
+            ? `Changes:\n${successful.map(formatResultLine).join("\n")}`
             : "",
     ].filter(Boolean);
 
     if (toUpload.length > 0) {
-        UploadManager.addFiles({
-            channelId,
-            draftType: DraftType.ChannelMessage,
-            files: toUpload.map(file => ({ file, platform: 1 })),
-            showLargeMessageDialog: false,
-        });
+        await addFilesToUploadManager(channelId, toUpload);
         createUploadCancelCard(channelId, toUpload);
     }
 
@@ -651,6 +965,22 @@ async function handleFiles(allFiles: File[]) {
         color: failed.length === 0 ? "#43b581" : successful.length === 0 ? "#f04747" : "#faa61a",
         noPersist: false,
     });
+}
+
+async function processFilesLimited(files: File[]): Promise<ProcessResult[]> {
+    const results: ProcessResult[] = new Array(files.length);
+    const limit = getConcurrentJobs();
+    let nextIndex = 0;
+
+    async function worker() {
+        while (nextIndex < files.length) {
+            const index = nextIndex++;
+            results[index] = await processFile(files[index]);
+        }
+    }
+
+    await Promise.all(Array.from({ length: Math.min(limit, files.length) }, () => worker()));
+    return results;
 }
 
 async function resolveInputPath(
@@ -715,6 +1045,20 @@ async function loadImage(file: File): Promise<HTMLImageElement> {
 }
 
 function getImageBounds(width: number, height: number): { width: number; height: number; } {
+    const custom = getCustomMaxDimensions();
+    if (custom.width > 0 || custom.height > 0) {
+        const scale = Math.min(
+            1,
+            custom.width > 0 ? custom.width / width : 1,
+            custom.height > 0 ? custom.height / height : 1,
+        );
+
+        return {
+            width: Math.max(1, Math.round(width * scale)),
+            height: Math.max(1, Math.round(height * scale)),
+        };
+    }
+
     const bounds: Record<string, { width: number; height: number; }> = {
         "1080": { width: 1920, height: 1080 },
         "720": { width: 1280, height: 720 },
@@ -795,7 +1139,14 @@ async function processImageFile(file: File): Promise<ProcessResult> {
         }
 
         if (bestBlob.size >= file.size) {
+            const fallback = makeOriginalFallbackResult(file, "compression was larger");
+            if (fallback) return fallback;
+
             throw new Error("image compression did not reduce file size");
+        }
+
+        if (bestBlob.size > targetBytes) {
+            throw new Error(`compressed image is ${formatBytes(bestBlob.size)}, above target ${formatBytes(targetBytes)}`);
         }
 
         updateProgressCard(jobId, 100, "100%");
@@ -805,17 +1156,20 @@ async function processImageFile(file: File): Promise<ProcessResult> {
         return {
             success: true,
             file: compressedFile,
+            originalFileName: file.name,
             originalSizeMB: file.size / (1024 * 1024),
             sizeMB: bestBlob.size / (1024 * 1024),
             encoderUsed: outputType === "image/jpeg" ? "canvas-jpeg" : "canvas-webp",
+            output: "compressed",
         };
     } catch (err) {
         if ((err as { cancelled?: boolean; })?.cancelled) {
-            return { success: false, fileName: file.name, error: "cancelled", cancelled: true };
+            return { success: false, file, fileName: file.name, error: "cancelled", cancelled: true };
         }
 
         return {
             success: false,
+            file,
             fileName: file.name,
             error: err instanceof Error ? err.message : String(err),
         };
@@ -866,34 +1220,57 @@ async function processMediaFile(file: File): Promise<ProcessResult> {
             getCompressionTargetMB(),
             settings.store.compressionPreset,
             settings.store.maxResolution,
+            getCustomMaxDimensions().width,
+            getCustomMaxDimensions().height,
+            settings.store.useHardwareDecode,
             settings.store.ffmpegTimeout * 1000,
         );
 
         if (!res.success) {
             if (res.cancelled) {
-                return { success: false, fileName: file.name, error: "cancelled", cancelled: true };
+                return { success: false, file, fileName: file.name, error: "cancelled", cancelled: true };
             }
 
-            return { success: false, fileName: file.name, error: res.error };
+            return { success: false, file, fileName: file.name, error: res.error };
         }
 
         outPath = res.outPath;
         const bytes = await Native.readFileBytes(outPath);
+        if (bytes.byteLength >= file.size) {
+            const fallback = makeOriginalFallbackResult(file, "compression was larger");
+            if (fallback) return fallback;
+
+            return { success: false, file, fileName: file.name, error: "compressed file was not smaller" };
+        }
+
+        const targetBytes = getCompressionTargetBytes();
+        if (bytes.byteLength > targetBytes) {
+            return {
+                success: false,
+                file,
+                fileName: file.name,
+                error: `compressed file is ${formatBytes(bytes.byteLength)}, above target ${formatBytes(targetBytes)}`,
+            };
+        }
+
         const compressedFile = new File([bytes], file.name, { type: file.type });
         return {
             success: true,
             file: compressedFile,
+            originalFileName: file.name,
             originalSizeMB: file.size / (1024 * 1024),
             sizeMB: bytes.byteLength / (1024 * 1024),
             encoderUsed: res.encoderUsed,
+            output: "compressed",
         };
     } catch (err) {
         if ((err as { cancelled?: boolean; })?.cancelled) {
-            return { success: false, fileName: file.name, error: "cancelled", cancelled: true };
+            return { success: false, file, fileName: file.name, error: "cancelled", cancelled: true };
         }
 
         return {
             success: false,
+            file,
             fileName: file.name,
             error: err instanceof Error ? err.message : String(err),
         };
@@ -913,11 +1290,13 @@ export default definePlugin({
     settings,
 
     start() {
+        document.addEventListener("dragover", hookDragOver, { capture: true });
         document.addEventListener("drop", hookDrop, { capture: true });
         document.addEventListener("paste", hookPaste, { capture: true });
     },
 
     stop() {
+        document.removeEventListener("dragover", hookDragOver, { capture: true });
         document.removeEventListener("drop", hookDrop, { capture: true });
         document.removeEventListener("paste", hookPaste, { capture: true });
         document.getElementById(OVERLAY_ID)?.remove();
