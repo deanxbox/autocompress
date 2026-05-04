@@ -278,23 +278,22 @@ export async function handleFile(
     timeout: number,
 ): Promise<CompressResult> {
     const preferredExt = isAudioMime(mimeType) ? ".m4a" : ".mp4";
-    const fileExt = path.extname(fileName) || preferredExt;
-    const outPath = path.join(os.tmpdir(), `ac_out_${jobId}${fileExt}`);
+    const outPath = path.join(os.tmpdir(), `ac_out_${jobId}${preferredExt}`);
 
     try {
         const duration = await getMediaDuration(filePath);
 
-        const audioBitrate = 128;
         const targetBits = target * 8 * 1024 * 1024;
-        const audioBits = audioBitrate * 1000 * duration;
         const hasVideo = !isAudioMime(mimeType);
-        const videoBitrate = hasVideo
+        const rawAudioBitrateKbps = Math.floor((target * 8 * 1024) / duration);
+        const audioBitrate = hasVideo
+            ? 128
+            : Math.min(192, Math.max(64, rawAudioBitrateKbps));
+        const audioBits = audioBitrate * 1000 * duration;
+        const rawVideoBitrate = hasVideo
             ? Math.floor((targetBits - audioBits) / duration / 1000)
             : 0;
-
-        if (hasVideo && videoBitrate < 100) {
-            return { success: false, error: `target bitrate too low (${videoBitrate}k)` };
-        }
+        const videoBitrate = Math.max(100, rawVideoBitrate);
 
         const onProgress = (percent: number) => progressMap.set(jobId, percent);
         const registerJob = (proc: ChildProcess) => activeJobs.set(jobId, proc);
@@ -497,10 +496,7 @@ function buildScaleFilter(maxResolution: string, maxWidth: number, maxHeight: nu
 }
 
 function buildVideoFilter(maxResolution: string, maxWidth: number, maxHeight: number): string | null {
-    const scaleFilter = buildScaleFilter(maxResolution, maxWidth, maxHeight);
-    if (scaleFilter) return `${scaleFilter},format=yuv420p`;
-
-    return null;
+    return buildScaleFilter(maxResolution, maxWidth, maxHeight);
 }
 
 function compressVideo(

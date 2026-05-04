@@ -104,8 +104,7 @@ function normalizeSizeSetting(raw: unknown, fallbackValue: number, fallbackUnit:
 function formatSettingValue(value: number): string {
     if (!Number.isFinite(value)) return "0";
 
-    const rounded = Math.round(value * 1000) / 1000;
-    return Number.isInteger(rounded) ? String(rounded) : String(rounded);
+    return String(Math.round(value * 1000) / 1000);
 }
 
 function convertSizeValue(value: number, fromUnit: SizeUnit, toUnit: SizeUnit): number {
@@ -319,6 +318,11 @@ const settings = definePluginSettings({
     useOriginalIfWorse: {
         type: OptionType.BOOLEAN,
         description: "Upload the original file if compression makes it larger",
+        default: false,
+    },
+    uploadIfSmaller: {
+        type: OptionType.BOOLEAN,
+        description: "Upload the compressed file even if it exceeds the target, as long as it is smaller than the original",
         default: false,
     },
     failedFileBehavior: {
@@ -574,7 +578,7 @@ function formatResultLine(result: Extract<ProcessResult, { success: true; }>): s
         return `${result.originalFileName}: kept original (${formatSize(result.originalSizeMB)}${result.note ? `, ${result.note}` : ""})`;
     }
 
-    return `${result.originalFileName}: ${formatSize(result.originalSizeMB)} -> ${formatSize(result.sizeMB)} (${formatPercentChange(result.originalSizeMB, result.sizeMB)})`;
+    return `${result.originalFileName}: ${formatSize(result.originalSizeMB)} -> ${formatSize(result.sizeMB)} (${formatPercentChange(result.originalSizeMB, result.sizeMB)}${result.note ? `, ${result.note}` : ""})`;
 }
 
 function makeOriginalFallbackResult(file: File, note: string): Extract<ProcessResult, { success: true; }> | null {
@@ -909,10 +913,7 @@ async function doHandleFiles(allFiles: File[]) {
     const cancelled = results.filter((r): r is Extract<ProcessResult, { success: false; cancelled: true; }> => !r.success && !!r.cancelled);
     const failed = results.filter((r): r is Extract<ProcessResult, { success: false; }> => !r.success && !r.cancelled);
     const fallbackFiles = getFailedFileBehavior() === "upload-original"
-        ? failed.map(r => r.file).filter(file => file.size <= getCompressionTargetBytes())
-        : [];
-    const skippedOversizedFallbacks = getFailedFileBehavior() === "upload-original"
-        ? failed.filter(r => r.file.size > getCompressionTargetBytes())
+        ? failed.map(r => r.file)
         : [];
     const toUpload = [...successful.map(r => r.file), ...fallbackFiles, ...otherFiles];
 
@@ -938,7 +939,6 @@ async function doHandleFiles(allFiles: File[]) {
     const previewLines = [
         ...successful.map(formatResultLine),
         ...fallbackFiles.map(file => `${file.name}: uploaded original after compression failed`),
-        ...skippedOversizedFallbacks.map(file => `${file.fileName}: skipped original because it is above target`),
     ];
     createPostCompressionPreview(previewLines, failed.length === 0 ? "#43b581" : "#faa61a");
 
@@ -947,7 +947,6 @@ async function doHandleFiles(allFiles: File[]) {
         failed.length > 0 ? `Failed: ${failed.map(f => `${f.fileName} (${f.error})`).join(", ")}` : "",
         cancelled.length > 0 ? `Cancelled: ${cancelled.length}` : "",
         fallbackFiles.length > 0 ? `Fallback: uploaded ${fallbackFiles.length} original file(s)` : "",
-        skippedOversizedFallbacks.length > 0 ? `Skipped oversized originals: ${skippedOversizedFallbacks.length}` : "",
         successful.length > 0 ? `Encoder: ${Array.from(new Set(successful.map(r => r.encoderUsed))).join(", ")}` : "",
         successful.length > 0
             ? `Changes:\n${successful.map(formatResultLine).join("\n")}`
@@ -1119,9 +1118,10 @@ async function processImageFile(file: File): Promise<ProcessResult> {
 
         const outputType = file.type === "image/jpeg" ? "image/jpeg" : "image/webp";
         const targetBytes = getCompressionTargetBytes();
-        let low = 0.35;
+        let low = 0;
         let high = 0.92;
-        let bestBlob = await canvasToBlob(canvas, outputType, high);
+        let bestWithinTarget: Blob | null = null;
+        const lowestQualityBlob = await canvasToBlob(canvas, outputType, 0);
 
         for (let i = 0; i < 7; i++) {
             if (cancelled) throw makeCancelledError();
@@ -1131,12 +1131,14 @@ async function processImageFile(file: File): Promise<ProcessResult> {
             updateProgressCard(jobId, 15 + Math.round(((i + 1) / 7) * 80), "Compressing image...");
 
             if (blob.size <= targetBytes) {
-                bestBlob = blob;
+                bestWithinTarget = blob;
                 low = quality;
             } else {
                 high = quality;
             }
         }
+
+        const bestBlob = bestWithinTarget ?? lowestQualityBlob;
 
         if (bestBlob.size >= file.size) {
             const fallback = makeOriginalFallbackResult(file, "compression was larger");
@@ -1145,7 +1147,7 @@ async function processImageFile(file: File): Promise<ProcessResult> {
             throw new Error("image compression did not reduce file size");
         }
 
-        if (bestBlob.size > targetBytes) {
+        if (bestBlob.size > targetBytes && !settings.store.uploadIfSmaller) {
             throw new Error(`compressed image is ${formatBytes(bestBlob.size)}, above target ${formatBytes(targetBytes)}`);
         }
 
@@ -1161,6 +1163,7 @@ async function processImageFile(file: File): Promise<ProcessResult> {
             sizeMB: bestBlob.size / (1024 * 1024),
             encoderUsed: outputType === "image/jpeg" ? "canvas-jpeg" : "canvas-webp",
             output: "compressed",
+            note: bestBlob.size > targetBytes ? "above target" : undefined,
         };
     } catch (err) {
         if ((err as { cancelled?: boolean; })?.cancelled) {
@@ -1244,7 +1247,7 @@ async function processMediaFile(file: File): Promise<ProcessResult> {
         }
 
         const targetBytes = getCompressionTargetBytes();
-        if (bytes.byteLength > targetBytes) {
+        if (bytes.byteLength > targetBytes && !settings.store.uploadIfSmaller) {
             return {
                 success: false,
                 file,
@@ -1262,6 +1265,7 @@ async function processMediaFile(file: File): Promise<ProcessResult> {
             sizeMB: bytes.byteLength / (1024 * 1024),
             encoderUsed: res.encoderUsed,
             output: "compressed",
+            note: bytes.byteLength > targetBytes ? "above target" : undefined,
         };
     } catch (err) {
         if ((err as { cancelled?: boolean; })?.cancelled) {
@@ -1305,5 +1309,6 @@ export default definePlugin({
         validationCache = null;
         lastHandledBatchKey = "";
         lastHandledBatchAt = 0;
+        progressEstimates.clear();
     },
 });

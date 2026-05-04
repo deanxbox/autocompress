@@ -143,37 +143,26 @@ export async function detectEncoder(): Promise<VideoEncoder> {
     if (cachedEncoder !== null) return cachedEncoder;
 
     const ffmpegPath = pullBinary("ffmpeg");
-
-    console.log("[AutoCompress] starting encoder detection, ffmpeg:", ffmpegPath);
-
     const vendorEncoder = await getVendorEncoder();
-    console.log("[AutoCompress] vendor encoder candidate:", vendorEncoder);
 
     if (vendorEncoder) {
-        console.log("[AutoCompress] test-encoding with", vendorEncoder, "...");
         const works = await testEncode(ffmpegPath, vendorEncoder);
-        console.log("[AutoCompress]", vendorEncoder, "test result:", works);
         if (works) {
             cachedEncoder = vendorEncoder;
-            console.log("[AutoCompress] selected encoder:", cachedEncoder);
             return cachedEncoder;
         }
     }
 
     for (const encoder of GPU_ENCODERS) {
         if (encoder === vendorEncoder) continue;
-        console.log("[AutoCompress] trying fallback encoder:", encoder);
         const works = await testEncode(ffmpegPath, encoder);
-        console.log("[AutoCompress]", encoder, "test result:", works);
         if (works) {
             cachedEncoder = encoder;
-            console.log("[AutoCompress] selected encoder:", cachedEncoder);
             return cachedEncoder;
         }
     }
 
     cachedEncoder = "libx264";
-    console.log("[AutoCompress] no GPU encoder worked, falling back to:", cachedEncoder);
     return cachedEncoder;
 }
 
