@@ -6,7 +6,7 @@
 
 import { ChildProcess, spawn } from "node:child_process";
 import { createWriteStream, WriteStream } from "node:fs";
-import { readFile, unlink } from "node:fs/promises";
+import { readFile, stat, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -30,6 +30,16 @@ const openStreams = new Map<string, WriteStream>();
 const progressMap = new Map<string, number>();
 const activeJobs = new Map<string, ChildProcess>();
 const cancelledJobs = new Set<string>();
+const TARGET_BITRATE_SAFETY = 0.9;
+const MIN_VIDEO_BITRATE_KBPS = 40;
+const MIN_AUDIO_BITRATE_KBPS = 24;
+const VIDEO_RETRY_BITRATE_SCALES = [1, 0.82, 0.68, 0.55];
+const AUDIO_RETRY_BITRATE_SCALES = [1, 0.8, 0.64, 0.5];
+const AUDIO_EXTENSIONS = new Set([
+    ".mp3",
+    ".wav",
+    ".flac",
+]);
 
 function mapNvencPreset(preset: string): string {
     const presets: Record<string, string> = {
@@ -122,6 +132,33 @@ function buildEncoderArgs(encoder: VideoEncoder, vidBitrate: number, preset: str
 
 function isAudioMime(mimeType: string): boolean {
     return mimeType.startsWith("audio/");
+}
+
+function getFileExtension(fileName: string): string {
+    const extension = fileName.match(/\.[^/.]+$/)?.[0];
+
+    return extension?.toLowerCase() ?? "";
+}
+
+function isAudioFile(fileName: string, mimeType: string): boolean {
+    return isAudioMime(mimeType.toLowerCase()) || AUDIO_EXTENSIONS.has(getFileExtension(fileName));
+}
+
+function getVideoAudioBitrate(totalBitrate: number): number {
+    if (totalBitrate <= 96) return MIN_AUDIO_BITRATE_KBPS;
+    if (totalBitrate <= 180) return 32;
+    if (totalBitrate <= 360) return 48;
+    if (totalBitrate <= 800) return 64;
+
+    return Math.min(96, Math.floor(totalBitrate * 0.18));
+}
+
+function getAudioOnlyBitrate(totalBitrate: number): number {
+    return Math.min(160, Math.max(MIN_AUDIO_BITRATE_KBPS, totalBitrate));
+}
+
+function getScaledBitrate(bitrate: number, scale: number, minimum: number): number {
+    return Math.max(minimum, Math.floor(bitrate * scale));
 }
 
 export async function openTempFile(_: IpcMainInvokeEvent, fileName: string): Promise<string> {
@@ -277,23 +314,22 @@ export async function handleFile(
     useHardwareDecode: boolean,
     timeout: number,
 ): Promise<CompressResult> {
-    const preferredExt = isAudioMime(mimeType) ? ".m4a" : ".mp4";
+    const hasVideo = !isAudioFile(fileName, mimeType);
+    const preferredExt = hasVideo ? ".mp4" : ".m4a";
     const outPath = path.join(os.tmpdir(), `ac_out_${jobId}${preferredExt}`);
 
     try {
         const duration = await getMediaDuration(filePath);
 
-        const targetBits = target * 8 * 1024 * 1024;
-        const hasVideo = !isAudioMime(mimeType);
-        const rawAudioBitrateKbps = Math.floor((target * 8 * 1024) / duration);
+        const targetBytes = target * 1024 * 1024;
+        const targetBits = targetBytes * 8 * TARGET_BITRATE_SAFETY;
+        const totalBitrateKbps = Math.max(MIN_AUDIO_BITRATE_KBPS, Math.floor(targetBits / duration / 1000));
         const audioBitrate = hasVideo
-            ? 128
-            : Math.min(192, Math.max(64, rawAudioBitrateKbps));
-        const audioBits = audioBitrate * 1000 * duration;
-        const rawVideoBitrate = hasVideo
-            ? Math.floor((targetBits - audioBits) / duration / 1000)
+            ? getVideoAudioBitrate(totalBitrateKbps)
+            : getAudioOnlyBitrate(totalBitrateKbps);
+        const videoBitrate = hasVideo
+            ? Math.max(MIN_VIDEO_BITRATE_KBPS, totalBitrateKbps - audioBitrate)
             : 0;
-        const videoBitrate = Math.max(100, rawVideoBitrate);
 
         const onProgress = (percent: number) => progressMap.set(jobId, percent);
         const registerJob = (proc: ChildProcess) => activeJobs.set(jobId, proc);
@@ -318,40 +354,53 @@ export async function handleFile(
                     : [resolution];
 
                 for (const resolutionAttempt of resolutionAttempts) {
-                    await unlink(outPath).catch(() => {});
-                    onProgress(0);
+                    for (let bitrateAttempt = 0; bitrateAttempt < VIDEO_RETRY_BITRATE_SCALES.length; bitrateAttempt++) {
+                        const bitrateScale = VIDEO_RETRY_BITRATE_SCALES[bitrateAttempt];
+                        const scaledVideoBitrate = getScaledBitrate(videoBitrate, bitrateScale, MIN_VIDEO_BITRATE_KBPS);
+                        const scaledAudioBitrate = getScaledBitrate(audioBitrate, bitrateScale, MIN_AUDIO_BITRATE_KBPS);
 
-                    try {
-                        await compressVideo(
-                            filePath,
-                            outPath,
-                            videoBitrate,
-                            audioBitrate,
-                            preset,
-                            resolutionAttempt,
-                            maxWidth,
-                            maxHeight,
-                            useHardwareDecode,
-                            timeout,
-                            encoder,
-                            duration,
-                            onProgress,
-                            registerJob,
-                            () => cancelledJobs.has(jobId),
-                        );
-                        encoderUsed = encoder;
-                        break encoderLoop;
-                    } catch (err) {
-                        activeJobs.delete(jobId);
+                        await unlink(outPath).catch(() => {});
+                        onProgress(0);
 
-                        const maybeCancelled = err as { cancelled?: boolean; message?: string; toString(): string; };
-                        if (maybeCancelled?.cancelled || cancelledJobs.has(jobId)) {
-                            const cancelErr = new Error("cancelled") as Error & { cancelled?: boolean; };
-                            cancelErr.cancelled = true;
-                            throw cancelErr;
+                        try {
+                            await compressVideo(
+                                filePath,
+                                outPath,
+                                scaledVideoBitrate,
+                                scaledAudioBitrate,
+                                preset,
+                                resolutionAttempt,
+                                maxWidth,
+                                maxHeight,
+                                useHardwareDecode,
+                                timeout,
+                                encoder,
+                                duration,
+                                onProgress,
+                                registerJob,
+                                () => cancelledJobs.has(jobId),
+                            );
+
+                            const outputSize = (await stat(outPath)).size;
+                            if (outputSize <= targetBytes || bitrateAttempt === VIDEO_RETRY_BITRATE_SCALES.length - 1) {
+                                encoderUsed = encoder;
+                                break encoderLoop;
+                            }
+
+                            errors.push(`${encoder}${resolutionAttempt === resolution ? "" : ` (${resolutionAttempt}p retry)`}: ${Math.round(bitrateScale * 100)}% bitrate produced ${(outputSize / 1024 / 1024).toFixed(2)}MB, retrying lower`);
+                        } catch (err) {
+                            activeJobs.delete(jobId);
+
+                            const maybeCancelled = err as { cancelled?: boolean; message?: string; toString(): string; };
+                            if (maybeCancelled?.cancelled || cancelledJobs.has(jobId)) {
+                                const cancelErr = new Error("cancelled") as Error & { cancelled?: boolean; };
+                                cancelErr.cancelled = true;
+                                throw cancelErr;
+                            }
+
+                            errors.push(`${encoder}${resolutionAttempt === resolution ? "" : ` (${resolutionAttempt}p retry)`}: ${maybeCancelled?.message || maybeCancelled?.toString() || "unknown error"}`);
+                            break;
                         }
-
-                        errors.push(`${encoder}${resolutionAttempt === resolution ? "" : ` (${resolutionAttempt}p retry)`}: ${maybeCancelled?.message || maybeCancelled?.toString() || "unknown error"}`);
                     }
                 }
             }
@@ -366,16 +415,27 @@ export async function handleFile(
             activeJobs.delete(jobId);
             return { success: true, outPath, encoderUsed };
         } else {
-            await compressAudio(
-                filePath,
-                outPath,
-                audioBitrate,
-                timeout,
-                duration,
-                onProgress,
-                registerJob,
-                () => cancelledJobs.has(jobId),
-            );
+            for (let bitrateAttempt = 0; bitrateAttempt < AUDIO_RETRY_BITRATE_SCALES.length; bitrateAttempt++) {
+                const bitrateScale = AUDIO_RETRY_BITRATE_SCALES[bitrateAttempt];
+                const scaledAudioBitrate = getScaledBitrate(audioBitrate, bitrateScale, MIN_AUDIO_BITRATE_KBPS);
+
+                await unlink(outPath).catch(() => {});
+                onProgress(0);
+
+                await compressAudio(
+                    filePath,
+                    outPath,
+                    scaledAudioBitrate,
+                    timeout,
+                    duration,
+                    onProgress,
+                    registerJob,
+                    () => cancelledJobs.has(jobId),
+                );
+
+                const outputSize = (await stat(outPath)).size;
+                if (outputSize <= targetBytes || bitrateAttempt === AUDIO_RETRY_BITRATE_SCALES.length - 1) break;
+            }
 
             activeJobs.delete(jobId);
             return { success: true, outPath, encoderUsed: "aac" };
@@ -525,7 +585,7 @@ function compressVideo(
             ...(canUseHardwareDecode ? ["-hwaccel", "auto"] : []),
             "-i", inputPath,
             "-map", "0:v:0",
-            "-map", "0:a?",
+            "-map", "0:a:0?",
             ...buildEncoderArgs(encoder, vidBitrate, preset),
         ];
 
@@ -537,7 +597,9 @@ function compressVideo(
             "-pix_fmt", "yuv420p",
             "-c:a", "aac",
             "-b:a", `${audioBitrate}k`,
-            "-map_metadata", "0",
+            "-ac", "2",
+            "-map_metadata", "-1",
+            "-map_chapters", "-1",
             "-movflags", "+faststart",
             "-progress", "pipe:1",
             "-nostats",
@@ -619,7 +681,9 @@ function compressAudio(
             "-vn",
             "-c:a", "aac",
             "-b:a", `${audioBitrate}k`,
-            "-map_metadata", "0",
+            "-ac", "2",
+            "-map_metadata", "-1",
+            "-map_chapters", "-1",
             "-progress", "pipe:1",
             "-nostats",
             outputPath,

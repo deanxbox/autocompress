@@ -8,6 +8,7 @@ import { showNotification } from "@api/Notifications";
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import {
+    Alerts,
     DraftType,
     React,
     Select,
@@ -35,15 +36,42 @@ const MEDIA_FORMATS = new Set([
     "video/x-msvideo",
     "video/x-matroska",
     "video/webm",
+    "image/gif",
     "audio/mpeg",
     "audio/wav",
     "audio/flac",
+]);
+
+const MEDIA_EXTENSIONS = new Set([
+    ".mp4",
+    ".mov",
+    ".qt",
+    ".avi",
+    ".mkv",
+    ".webm",
+    ".gif",
+    ".mp3",
+    ".wav",
+    ".flac",
 ]);
 
 const IMAGE_FORMATS = new Set([
     "image/jpeg",
     "image/png",
     "image/webp",
+]);
+
+const IMAGE_EXTENSIONS = new Set([
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+]);
+
+const AUDIO_EXTENSIONS = new Set([
+    ".mp3",
+    ".wav",
+    ".flac",
 ]);
 
 const CHUNK_SIZE = 4 * 1024 * 1024;
@@ -204,6 +232,7 @@ function DiagnosticsControl() {
                 validation,
                 settings: {
                     compressionMode: settings.store.compressionMode,
+                    promptAfterInsertion: settings.store.promptAfterInsertion,
                     compressionTarget: settings.store.compressionTarget,
                     compressionThreshold: settings.store.compressionThreshold,
                     compressionPreset: settings.store.compressionPreset,
@@ -277,6 +306,11 @@ const settings = definePluginSettings({
         type: OptionType.SELECT,
         description: "Which attachment types AutoCompress should intercept",
         options: COMPRESSION_MODE_OPTIONS,
+    },
+    promptAfterInsertion: {
+        type: OptionType.BOOLEAN,
+        description: "Prompt to compress after every media insertion",
+        default: false,
     },
     ffmpegTimeout: {
         type: OptionType.NUMBER,
@@ -685,20 +719,41 @@ function isValid(files: FileList | undefined): files is FileList {
     return files !== undefined && files.length > 0;
 }
 
+function getFileExtension(fileName: string): string {
+    const extension = fileName.match(/\.[^/.]+$/)?.[0];
+
+    return extension?.toLowerCase() ?? "";
+}
+
 function getCompressionKind(file: File): CompressionKind | null {
-    if (MEDIA_FORMATS.has(file.type)) return "media";
-    if (IMAGE_FORMATS.has(file.type)) return "image";
+    const mimeType = file.type.toLowerCase();
+    const extension = getFileExtension(file.name);
+
+    if (MEDIA_FORMATS.has(mimeType) || MEDIA_EXTENSIONS.has(extension)) return "media";
+    if (IMAGE_FORMATS.has(mimeType) || IMAGE_EXTENSIONS.has(extension)) return "image";
     return null;
 }
 
-function shouldCompressFile(file: File): boolean {
+function canCompressFile(file: File): boolean {
     const kind = getCompressionKind(file);
     const mode = getCompressionMode();
 
     if (kind === null || mode === "off") return false;
     if (mode !== "auto" && kind !== mode) return false;
 
-    return file.size > getCompressionThresholdBytes();
+    return true;
+}
+
+function shouldCompressFile(file: File, ignoreThreshold = false): boolean {
+    if (!canCompressFile(file)) return false;
+
+    return ignoreThreshold || file.size > getCompressionThresholdBytes();
+}
+
+function shouldInterceptInsertion(file: File): boolean {
+    return settings.store.promptAfterInsertion
+        ? canCompressFile(file)
+        : shouldCompressFile(file);
 }
 
 function getBatchKey(files: File[]): string {
@@ -819,21 +874,81 @@ async function validateBinaries(): Promise<boolean> {
     return true;
 }
 
+function promptToCompressFiles(files: File[]): Promise<boolean> {
+    const compressibleFiles = files.filter(canCompressFile);
+    const [firstFile] = compressibleFiles;
+    const totalSize = compressibleFiles.reduce((sum, file) => sum + file.size, 0);
+    const fileSummary = compressibleFiles.length === 1
+        ? `${firstFile.name} (${formatBytes(totalSize)})`
+        : `${compressibleFiles.length} files (${formatBytes(totalSize)})`;
+
+    return new Promise(resolve => {
+        let settled = false;
+        const settle = (value: boolean) => {
+            if (settled) return;
+
+            settled = true;
+            resolve(value);
+        };
+
+        Alerts.show({
+            title: "Compress media?",
+            body: React.createElement(
+                "div",
+                null,
+                React.createElement(Text, { variant: "text-md/normal" }, `AutoCompress can compress ${fileSummary} before upload.`),
+                React.createElement(Text, { color: "text-muted", variant: "text-sm/normal" }, `Target: ${formatBytes(getCompressionTargetBytes())}`),
+            ),
+            confirmText: "Compress",
+            cancelText: "Upload Original",
+            onConfirm: () => settle(true),
+            onCloseCallback: () => setImmediate(() => settle(false)),
+        });
+    });
+}
+
+async function uploadOriginalFiles(files: File[]) {
+    const channelId = SelectedChannelStore.getChannelId();
+    if (!channelId) return;
+
+    await addFilesToUploadManager(channelId, files);
+    createUploadCancelCard(channelId, files);
+}
+
+async function handleInsertedFiles(allFiles: File[], source: "paste" | "drop") {
+    if (shouldSkipDuplicateBatch(allFiles)) return;
+
+    const promptEnabled = settings.store.promptAfterInsertion;
+    const forceCompression = promptEnabled && await promptToCompressFiles(allFiles);
+
+    debugLog(`${source} intercepted`, allFiles.map(file => ({ name: file.name, size: file.size, type: file.type, shouldCompress: shouldCompressFile(file, forceCompression) })));
+
+    if (promptEnabled) {
+        debugLog("compression prompt result", { source, shouldCompress: forceCompression });
+
+        if (!forceCompression) {
+            await uploadOriginalFiles(allFiles);
+            return;
+        }
+    }
+
+    if (allFiles.some(file => shouldCompressFile(file, forceCompression) && getCompressionKind(file) === "media") && !(await validateBinaries())) return;
+
+    await handleFiles(allFiles, forceCompression);
+}
+
 async function hookPaste(event: ClipboardEvent) {
     const files = event.clipboardData?.files;
     if (!isValid(files)) return;
 
     const allFiles = Array.from(files);
-    if (!allFiles.some(shouldCompressFile)) return;
+    if (!allFiles.some(shouldInterceptInsertion)) return;
 
-    debugLog("paste intercepted", allFiles.map(file => ({ name: file.name, size: file.size, type: file.type, shouldCompress: shouldCompressFile(file) })));
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation();
-    if (shouldSkipDuplicateBatch(allFiles)) return;
-    if (allFiles.some(file => shouldCompressFile(file) && getCompressionKind(file) === "media") && !(await validateBinaries())) return;
 
-    await handleFiles(allFiles);
+    await handleInsertedFiles(allFiles, "paste");
 }
 
 function hookDragOver(event: DragEvent) {
@@ -850,21 +965,18 @@ async function hookDrop(event: DragEvent) {
     if (!isValid(files)) return;
 
     const allFiles = Array.from(files);
-    if (!allFiles.some(shouldCompressFile)) return;
+    if (!allFiles.some(shouldInterceptInsertion)) return;
 
-    debugLog("drop intercepted", allFiles.map(file => ({ name: file.name, size: file.size, type: file.type, shouldCompress: shouldCompressFile(file) })));
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation();
-    if (shouldSkipDuplicateBatch(allFiles)) return;
-    if (allFiles.some(file => shouldCompressFile(file) && getCompressionKind(file) === "media") && !(await validateBinaries())) return;
 
-    await handleFiles(allFiles);
+    await handleInsertedFiles(allFiles, "drop");
 }
 
-async function handleFiles(allFiles: File[]) {
+async function handleFiles(allFiles: File[], forceCompression = false) {
     try {
-        return await doHandleFiles(allFiles);
+        return await doHandleFiles(allFiles, forceCompression);
     } catch (err) {
         showNotification({
             title: "AutoCompress",
@@ -875,12 +987,12 @@ async function handleFiles(allFiles: File[]) {
     }
 }
 
-async function doHandleFiles(allFiles: File[]) {
+async function doHandleFiles(allFiles: File[], forceCompression = false) {
     const compressibleFiles: File[] = [];
     const otherFiles: File[] = [];
 
     for (const file of allFiles) {
-        if (shouldCompressFile(file)) {
+        if (shouldCompressFile(file, forceCompression)) {
             compressibleFiles.push(file);
         } else {
             otherFiles.push(file);
@@ -1086,10 +1198,86 @@ function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality: number):
     });
 }
 
+type ImageCompressionCandidate = {
+    blob: Blob;
+    outputType: string;
+};
+
+async function compressCanvasToTarget(
+    canvas: HTMLCanvasElement,
+    outputType: string,
+    targetBytes: number,
+    onIteration: (iteration: number, total: number) => void,
+    shouldCancel: () => boolean,
+): Promise<ImageCompressionCandidate> {
+    const totalIterations = 9;
+    let low = 0;
+    let high = 0.92;
+    let bestWithinTarget: Blob | null = null;
+    const lowestQualityBlob = await canvasToBlob(canvas, outputType, 0);
+
+    for (let i = 0; i < totalIterations; i++) {
+        if (shouldCancel()) throw makeCancelledError();
+
+        const quality = (low + high) / 2;
+        const blob = await canvasToBlob(canvas, outputType, quality);
+        onIteration(i + 1, totalIterations);
+
+        if (blob.size <= targetBytes) {
+            bestWithinTarget = blob;
+            low = quality;
+        } else {
+            high = quality;
+        }
+    }
+
+    return {
+        blob: bestWithinTarget ?? lowestQualityBlob,
+        outputType,
+    };
+}
+
+async function getBestImageCompression(
+    canvas: HTMLCanvasElement,
+    sourceType: string,
+    targetBytes: number,
+    onProgress: (percent: number) => void,
+    shouldCancel: () => boolean,
+): Promise<ImageCompressionCandidate> {
+    const outputTypes = sourceType === "image/jpeg"
+        ? ["image/jpeg", "image/webp"]
+        : ["image/webp"];
+    const candidates: ImageCompressionCandidate[] = [];
+
+    for (let i = 0; i < outputTypes.length; i++) {
+        const baseProgress = Math.round((i / outputTypes.length) * 80);
+        const progressShare = Math.round(80 / outputTypes.length);
+        const candidate = await compressCanvasToTarget(
+            canvas,
+            outputTypes[i],
+            targetBytes,
+            (iteration, total) => onProgress(15 + baseProgress + Math.round((iteration / total) * progressShare)),
+            shouldCancel,
+        );
+        candidates.push(candidate);
+    }
+
+    return candidates.reduce((best, candidate) => candidate.blob.size < best.blob.size ? candidate : best);
+}
+
 function replaceExtension(fileName: string, extension: string): string {
     return fileName.includes(".")
         ? fileName.replace(/\.[^/.]+$/, extension)
         : `${fileName}${extension}`;
+}
+
+function getCompressedMediaOutput(file: File): { name: string; type: string; } {
+    const isAudio = file.type.toLowerCase().startsWith("audio/")
+        || AUDIO_EXTENSIONS.has(getFileExtension(file.name));
+
+    return isAudio
+        ? { name: replaceExtension(file.name, ".m4a"), type: "audio/mp4" }
+        : { name: replaceExtension(file.name, ".mp4"), type: "video/mp4" };
 }
 
 async function processImageFile(file: File): Promise<ProcessResult> {
@@ -1116,29 +1304,15 @@ async function processImageFile(file: File): Promise<ProcessResult> {
 
         ctx.drawImage(image, 0, 0, dimensions.width, dimensions.height);
 
-        const outputType = file.type === "image/jpeg" ? "image/jpeg" : "image/webp";
         const targetBytes = getCompressionTargetBytes();
-        let low = 0;
-        let high = 0.92;
-        let bestWithinTarget: Blob | null = null;
-        const lowestQualityBlob = await canvasToBlob(canvas, outputType, 0);
-
-        for (let i = 0; i < 7; i++) {
-            if (cancelled) throw makeCancelledError();
-
-            const quality = (low + high) / 2;
-            const blob = await canvasToBlob(canvas, outputType, quality);
-            updateProgressCard(jobId, 15 + Math.round(((i + 1) / 7) * 80), "Compressing image...");
-
-            if (blob.size <= targetBytes) {
-                bestWithinTarget = blob;
-                low = quality;
-            } else {
-                high = quality;
-            }
-        }
-
-        const bestBlob = bestWithinTarget ?? lowestQualityBlob;
+        const imageCompression = await getBestImageCompression(
+            canvas,
+            file.type.toLowerCase(),
+            targetBytes,
+            percent => updateProgressCard(jobId, percent, "Compressing image..."),
+            () => cancelled,
+        );
+        const bestBlob = imageCompression.blob;
 
         if (bestBlob.size >= file.size) {
             const fallback = makeOriginalFallbackResult(file, "compression was larger");
@@ -1152,6 +1326,7 @@ async function processImageFile(file: File): Promise<ProcessResult> {
         }
 
         updateProgressCard(jobId, 100, "100%");
+        const { outputType } = imageCompression;
         const outputName = outputType === file.type ? file.name : replaceExtension(file.name, ".webp");
         const compressedFile = new File([bestBlob], outputName, { type: outputType });
 
@@ -1256,7 +1431,8 @@ async function processMediaFile(file: File): Promise<ProcessResult> {
             };
         }
 
-        const compressedFile = new File([bytes], file.name, { type: file.type });
+        const output = getCompressedMediaOutput(file);
+        const compressedFile = new File([bytes], output.name, { type: output.type });
         return {
             success: true,
             file: compressedFile,

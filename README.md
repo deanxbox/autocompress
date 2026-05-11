@@ -6,6 +6,7 @@
 - bounded concurrent compression jobs so multi-file uploads do not launch every ffmpeg encode at once
 - progress overlay with ETA, upload cancellation, and a post-compression size preview
 - optional custom image/video dimensions, plus quick preset limits
+- optional prompt before compressing inserted media
 - diagnostics button in settings for ffmpeg/GPU encoder troubleshooting
 
 ## How It Works
@@ -23,10 +24,13 @@
 - set a limit a bit below your ideal size
 - target size and compression threshold can use KB, MB, or GB units
 - use Compression Mode to limit compression to videos/audio, images, both, or neither
+- enable "Prompt to compress after every media insertion" to choose between compression and uploading originals each time AutoCompress intercepts media
 - failed files are skipped by default, but can optionally upload originals; compression results that are larger than the source can also optionally fall back to the original
 - increasing Concurrent Jobs can improve GPU video engine usage on systems that can handle multiple simultaneous encodes
 - ensure you set a realistic time limit 
 - lower resolution scaling can help encoding speed & artifacting 
 - GPU encoders are preferred when available (`h264_nvenc`, `h264_amf`, `h264_qsv`, or `h264_videotoolbox`), with software `libx264` as the final fallback
+- video-like media, including MOV and GIF files, is reencoded to MP4; audio-only media is reencoded to M4A
+- large outputs are retried at lower bitrates to get closer to the configured target
 - very large source videos may be retried at 1080p on GPU if the hardware encoder rejects the original resolution
 - large JPEG, PNG, and WebP images are compressed in-browser and are only intercepted when they exceed the configured threshold
